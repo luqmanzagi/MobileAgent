@@ -28,6 +28,7 @@ import json
 import pdb
 import ast
 import re
+from datetime import datetime
 
 from OpenOCR.tools.infer_e2e import OpenOCR
 
@@ -73,29 +74,146 @@ def draw_coordinates_boxes_on_image(image_path, coordinates, output_image_path, 
         os.remove(output_image_path)
     image.save(output_image_path)
 
+# ---- Token & cost accounting ----------------------------------------------
+try:
+    import tiktoken  # optional fallback for text-only estimates
+except Exception:
+    tiktoken = None
+
+TOKEN_BANK = {
+    "llm": {"prompt": 0, "completion": 0},
+    "vl":  {"prompt": 0, "completion": 0},
+}
+
+# ---- Pricing (externalized) -----------------------------------------------
+def load_pricing(path: str) -> dict:
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            # Optional: basic validation + coercion
+            out = {}
+            for model, p in data.items():
+                out[str(model)] = {
+                    "prompt": float(p["prompt"]),
+                    "completion": float(p["completion"]),
+                }
+            return out
+    except FileNotFoundError:
+        print(f"[pricing] File not found: {path}. Using empty pricing table.")
+        return {}
+    except Exception as e:
+        print(f"[pricing] Failed to read {path}: {e}. Using empty pricing table.")
+        return {}
+
+
+def add_usage(kind: str, model: str, usage: dict | None, fallback_messages=None, fallback_text: str | None = None):
+    """
+    kind: 'llm' or 'vl'
+    usage: {'prompt_tokens': int, 'completion_tokens': int} if the API returned it
+    fallback_*: used only when usage is None (rough estimate, text only)
+    """
+    prompt = 0
+    completion = 0
+
+    if usage and all(k in usage for k in ("prompt_tokens", "completion_tokens")):
+        prompt = int(usage["prompt_tokens"] or 0)
+        completion = int(usage["completion_tokens"] or 0)
+    else:
+        # approximate (text-only) if API doesn't return usage
+        if tiktoken and fallback_messages:
+            try:
+                enc = tiktoken.get_encoding("cl100k_base")
+                def count_msg_tokens(msgs):
+                    # counts only textual parts; images are ignored
+                    total = 0
+                    for m in msgs:
+                        total += 3  # chat framing heuristic
+                        for part in m.get("content", []):
+                            if part.get("type") == "text":
+                                total += len(enc.encode(str(part.get("text", ""))))
+                    return total + 3  # assistant priming
+                prompt = count_msg_tokens(fallback_messages)
+            except Exception:
+                pass
+        if tiktoken and fallback_text:
+            try:
+                enc = tiktoken.get_encoding("cl100k_base")
+                completion = len(enc.encode(fallback_text))
+            except Exception:
+                pass
+
+    TOKEN_BANK[kind]["prompt"] += prompt
+    TOKEN_BANK[kind]["completion"] += completion
+    # also store last usage to show per-step if needed
+    return prompt, completion
+
+def cost_for(model: str, prompt_tokens: int, completion_tokens: int) -> float:
+    p = PRICING.get(model)
+    if not p:
+        return 0.0
+    return (prompt_tokens/1000.0)*p["prompt"] + (completion_tokens/1000.0)*p["completion"]
+
+
+    # ---- Final token and cost summary ------------------------------------------
+def _print_summary():
+    llm_p = TOKEN_BANK["llm"]["prompt"]
+    llm_c = TOKEN_BANK["llm"]["completion"]
+    vl_p  = TOKEN_BANK["vl"]["prompt"]
+    vl_c  = TOKEN_BANK["vl"]["completion"]
+
+    total_p = llm_p + vl_p
+    total_c = llm_c + vl_c
+
+    llm_cost = cost_for(llm_model_version, llm_p, llm_c)
+    vl_cost  = cost_for(vl_model_version,  vl_p,  vl_c)
+    total_cost = llm_cost + vl_cost
+
+    print("\n" + "="*80)
+    print("TOKEN USAGE SUMMARY")
+    print("-"*80)
+    print(f"LLM model: {llm_model_version}")
+    print(f"  prompt:     {llm_p:,}")
+    print(f"  completion: {llm_c:,}")
+    print(f"VL  model: {vl_model_version}")
+    print(f"  prompt:     {vl_p:,}")
+    print(f"  completion: {vl_c:,}")
+    print("-"*80)
+    print(f"TOTAL prompt:     {total_p:,}")
+    print(f"TOTAL completion: {total_c:,}")
+    if PRICING.get(llm_model_version) or PRICING.get(vl_model_version):
+        print("-"*80)
+        if PRICING.get(llm_model_version):
+            print(f"LLM cost: ${llm_cost:,.4f}")
+        if PRICING.get(vl_model_version):
+            print(f"VL  cost: ${vl_cost:,.4f}")
+        print(f"TOTAL cost: ${total_cost:,.4f}")
+    print("="*80 + "\n")
 
 parser = argparse.ArgumentParser(description="PC Agent")
 parser.add_argument('--instruction', type=str, default="")
 
 parser.add_argument('--use_som', type=int, default=1) # for action
 parser.add_argument('--draw_text_box', type=int, default=0, help="whether to draw text boxes in som.")
-parser.add_argument('--font_path', type=str, default="/System/Library/Fonts/Supplemental/Times New Roman.ttf")
+# parser.add_argument('--font_path', type=str, default="/System/Library/Fonts/Supplemental/Times New Roman.ttf")
+parser.add_argument('--font_path', type=str, default="C:/Windows/Fonts/arial.ttf")
 parser.add_argument('--add_info', type=str, default="Click the search bar in the middle of the page to search")
 
-parser.add_argument('--disable_reflection', type=int, default=1)
+parser.add_argument('--disable_reflection', type=int, default=0)
 parser.add_argument('--clear_history_each_subtask', type=int, default=1)
 parser.add_argument('--ratio', type=float, default=1.0) # 1.0 for windows and 2.0 for mac
 parser.add_argument('--use_a11y', type=int, default=1)
 parser.add_argument('--text_len_thre', type=int, default=1000)
 parser.add_argument('--num_step_limit', type=int, default=20)
-parser.add_argument('--simple', type=int, default=1) # for simple instruction
+parser.add_argument('--simple', type=int, default=0) # for simple instruction
 parser.add_argument('--screenshot_root', type=str, default='task_')
 parser.add_argument('--mute', type=int, default=0)
-parser.add_argument('--mac', type=int, default=1)
+parser.add_argument('--mac', type=int, default=0)
 parser.add_argument('--ocr_api', type=int, default=0) # use ocr api or ocr local model
+parser.add_argument('--pricing_file', type=str, default='pricing.json',
+                    help='Path to JSON file containing per-1K token pricing.')
 
 args = parser.parse_args()
-
+PRICING = load_pricing(args.pricing_file)
 exclude_words = ["系统"]
 # TODO
 # exclude_words = json.load(open('filter_icon.json', 'r'))
@@ -208,7 +326,16 @@ def select(content, screenshot_file):
     prompt_select = get_select_prompt(content)
     chat_select = init_action_chat()
     chat_select = add_response("user", prompt_select, chat_select, [screenshot_file])
-    output_select = inference_chat(chat_select, vl_model_version, API_url, token)
+    # output_select = inference_chat(chat_select, vl_model_version, API_url, token)
+    ret = inference_chat(chat_select, vl_model_version, API_url, token)
+    if isinstance(ret, tuple):
+        output_select, _usage = ret
+    else:
+        output_select, _usage = ret, None
+    _fallback_msgs = [{"role": r, "content": c} for (r, c) in chat_select]
+    add_usage("vl", vl_model_version, _usage, fallback_messages=_fallback_msgs, fallback_text=output_select)
+
+
     print(output_select)
     first_line = output_select.split('<first>')[-1].split('</first>')[0][:30]
     last_line = output_select.split('<last>')[-1].split('</last>')[0][-30:]
@@ -540,7 +667,9 @@ completed_requirements = ""
 memory = ""
 insight = ""
 temp_file = "temp"
-screenshot_root = args.screenshot_root + '%d/' % (1)
+# screenshot_root = args.screenshot_root + '%d/' % (1)
+current_time = datetime.now().strftime('%Y%m%d_%H%M')
+screenshot_root = f'task_{current_time}/'
 
 if os.path.exists(temp_file):
     shutil.rmtree(temp_file)
@@ -565,7 +694,18 @@ if args.simple == 1:
 else:
     for i in range(num_try_subtask):
         try:
-            output_subtask = inference_chat(chat_subtask, llm_model_version, API_url, token) # 2.2 modified
+            # output_subtask = inference_chat(chat_subtask, llm_model_version, API_url, token) # 2.2 modified
+
+            # Add this
+            ret = inference_chat(chat_subtask, llm_model_version, API_url, token)
+            if isinstance(ret, tuple):
+                output_subtask, _usage = ret
+            else:
+                output_subtask, _usage = ret, None
+
+            # (optional) fallback messages for estimation:
+            _fallback_msgs = [{"role": r, "content": c} for (r, c) in chat_subtask]
+            add_usage("llm", llm_model_version, _usage, fallback_messages=_fallback_msgs, fallback_text=output_subtask)
 
             if args.mute == 0:
                 print(output_subtask)
@@ -645,7 +785,15 @@ for i in range(num_subtask):
         else:
             chat_action = add_response("user", prompt_action, chat_action, [screenshot_file])
 
-        output_action = inference_chat(chat_action, vl_model_version, API_url, token)
+        # output_action = inference_chat(chat_action, vl_model_version, API_url, token)
+        ret = inference_chat(chat_action, vl_model_version, API_url, token)
+        if isinstance(ret, tuple):
+            output_action, _usage = ret
+        else:
+            output_action, _usage = ret, None
+        _fallback_msgs = [{"role": r, "content": c} for (r, c) in chat_action]
+        add_usage("vl", vl_model_version, _usage, fallback_messages=_fallback_msgs, fallback_text=output_action)
+
 
         output_for_save_this_step['action'] = output_action
 
@@ -802,7 +950,15 @@ for i in range(num_subtask):
         if memory_switch:
             prompt_memory = get_memory_prompt(insight)
             chat_action = add_response("user", prompt_memory, chat_action)
-            output_memory = inference_chat(chat_action, vl_model_version, API_url, token)
+            # output_memory = inference_chat(chat_action, vl_model_version, API_url, token)
+            ret = inference_chat(chat_action, vl_model_version, API_url, token)
+            if isinstance(ret, tuple):
+                output_memory, _usage = ret
+            else:
+                output_memory, _usage = ret, None
+            _fallback_msgs = [{"role": r, "content": c} for (r, c) in chat_action]
+            add_usage("vl", vl_model_version, _usage, fallback_messages=_fallback_msgs, fallback_text=output_memory)
+
             chat_action = add_response("assistant", output_memory, chat_action)
             status = "#" * 50 + " Memory " + "#" * 50
             print(status)
@@ -832,7 +988,15 @@ for i in range(num_subtask):
             chat_reflect = init_reflect_chat()
             chat_reflect = add_response("user", prompt_reflect, chat_reflect, [last_screenshot_file, screenshot_file])
 
-            output_reflect = inference_chat(chat_reflect, vl_model_version, API_url, token)
+            # output_reflect = inference_chat(chat_reflect, vl_model_version, API_url, token)
+            ret = inference_chat(chat_reflect, vl_model_version, API_url, token)
+            if isinstance(ret, tuple):
+                output_reflect, _usage = ret
+            else:
+                output_reflect, _usage = ret, None
+            _fallback_msgs = [{"role": r, "content": c} for (r, c) in chat_reflect]
+            add_usage("vl", vl_model_version, _usage, fallback_messages=_fallback_msgs, fallback_text=output_reflect)
+
 
             output_for_save_this_step['reflect'] = output_reflect
 
@@ -855,7 +1019,16 @@ for i in range(num_subtask):
                 chat_planning = init_memory_chat()
                 chat_planning = add_response("user", prompt_planning, chat_planning)
 
-                output_planning = inference_chat(chat_planning, llm_model_version, API_url, token)
+                # output_planning = inference_chat(chat_planning, llm_model_version, API_url, token)
+
+                ret = inference_chat(chat_planning, llm_model_version, API_url, token)
+                if isinstance(ret, tuple):
+                    output_planning, _usage = ret
+                else:
+                    output_planning, _usage = ret, None
+                _fallback_msgs = [{"role": r, "content": c} for (r, c) in chat_planning]
+                add_usage("llm", llm_model_version, _usage, fallback_messages=_fallback_msgs, fallback_text=output_planning)
+
 
                 output_for_save_this_step['planning'] = output_planning
 
@@ -874,7 +1047,16 @@ for i in range(num_subtask):
             prompt_planning = get_process_prompt(sub_instruction, thought_history, summary_history, action_history, completed_requirements, add_info)
             chat_planning = init_memory_chat()
             chat_planning = add_response("user", prompt_planning, chat_planning )
-            output_planning = inference_chat(chat_planning, llm_model_version, API_url, token)
+            # output_planning = inference_chat(chat_planning, llm_model_version, API_url, token)
+
+            ret = inference_chat(chat_planning, llm_model_version, API_url, token)
+            if isinstance(ret, tuple):
+                output_planning, _usage = ret
+            else:
+                output_planning, _usage = ret, None
+            _fallback_msgs = [{"role": r, "content": c} for (r, c) in chat_planning]
+            add_usage("llm", llm_model_version, _usage, fallback_messages=_fallback_msgs, fallback_text=output_planning)
+
             output_for_save_this_step['planning'] = output_planning
             chat_planning = add_response("assistant", output_planning, chat_planning )
             status = "#" * 50 + " Planning " + "#" * 50
@@ -891,5 +1073,13 @@ for i in range(num_subtask):
     if step_idx > args.num_step_limit:
         break
 
-json.dump(output_for_save, open(screenshot_root+'output_for_save.json', 'w', encoding='utf-8'), indent=4, ensure_ascii=False)
 
+
+
+
+
+json.dump(output_for_save, open(screenshot_root+'output_for_save.json', 'w', encoding='utf-8'), indent=4, ensure_ascii=False)
+try:
+    _print_summary()
+except Exception as e:
+    print("Token summary failed:", e)

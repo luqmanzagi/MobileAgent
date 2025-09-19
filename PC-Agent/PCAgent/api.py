@@ -59,8 +59,14 @@ def inference_chat(chat, model, api_url, token):
         else:
             break
 
+    msg = completion.choices[0].message.content
+    usage = getattr(completion, 'usage', None)
+    return msg if usage is None else (msg, {
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens
+    })
     
-    return json.loads(completion.model_dump_json())['choices'][0]['message']['content']
+    # return json.loads(completion.model_dump_json())['choices'][0]['message']['content']
 
     # headers = {
     #     "Content-Type": "application/json",
