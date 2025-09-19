@@ -4,3 +4,10 @@ __pycache__/
 # custom
 **/screenshot/*
 **/temp/*
+
+# results
+task_*
+
+# configs
+**/config*.json
+
