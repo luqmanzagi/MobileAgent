@@ -155,7 +155,7 @@ def cost_for(model: str, prompt_tokens: int, completion_tokens: int) -> float:
 
 
     # ---- Final token and cost summary ------------------------------------------
-def _print_summary():
+def _print_summary(save_path: str | None = None):
     llm_p = TOKEN_BANK["llm"]["prompt"]
     llm_c = TOKEN_BANK["llm"]["completion"]
     vl_p  = TOKEN_BANK["vl"]["prompt"]
@@ -168,26 +168,33 @@ def _print_summary():
     vl_cost  = cost_for(vl_model_version,  vl_p,  vl_c)
     total_cost = llm_cost + vl_cost
 
-    print("\n" + "="*80)
-    print("TOKEN USAGE SUMMARY")
-    print("-"*80)
-    print(f"LLM model: {llm_model_version}")
-    print(f"  prompt:     {llm_p:,}")
-    print(f"  completion: {llm_c:,}")
-    print(f"VL  model: {vl_model_version}")
-    print(f"  prompt:     {vl_p:,}")
-    print(f"  completion: {vl_c:,}")
-    print("-"*80)
-    print(f"TOTAL prompt:     {total_p:,}")
-    print(f"TOTAL completion: {total_c:,}")
+    lines = []
+    lines.append("\n" + "="*80)
+    lines.append("TOKEN USAGE SUMMARY")
+    lines.append("-"*80)
+    lines.append(f"LLM model: {llm_model_version}")
+    lines.append(f"  prompt:     {llm_p:,}")
+    lines.append(f"  completion: {llm_c:,}")
+    lines.append(f"VL  model: {vl_model_version}")
+    lines.append(f"  prompt:     {vl_p:,}")
+    lines.append(f"  completion: {vl_c:,}")
+    lines.append("-"*80)
+    lines.append(f"TOTAL prompt:     {total_p:,}")
+    lines.append(f"TOTAL completion: {total_c:,}")
     if PRICING.get(llm_model_version) or PRICING.get(vl_model_version):
-        print("-"*80)
+        lines.append("-"*80)
         if PRICING.get(llm_model_version):
-            print(f"LLM cost: ${llm_cost:,.4f}")
+            lines.append(f"LLM cost: ${llm_cost:,.4f}")
         if PRICING.get(vl_model_version):
-            print(f"VL  cost: ${vl_cost:,.4f}")
-        print(f"TOTAL cost: ${total_cost:,.4f}")
-    print("="*80 + "\n")
+            lines.append(f"VL  cost: ${vl_cost:,.4f}")
+        lines.append(f"TOTAL cost: ${total_cost:,.4f}")
+    lines.append("="*80 + "\n")
+    report = "\n".join(lines)
+
+    print(report)
+    if save_path:
+        with open(save_path, 'w', encoding='utf-8') as f:
+            f.write(report)
 
 parser = argparse.ArgumentParser(description="PC Agent")
 parser.add_argument('--instruction', type=str, default="")
@@ -1080,6 +1087,6 @@ for i in range(num_subtask):
 
 json.dump(output_for_save, open(screenshot_root+'output_for_save.json', 'w', encoding='utf-8'), indent=4, ensure_ascii=False)
 try:
-    _print_summary()
+    _print_summary(screenshot_root+"token_summary.txt")
 except Exception as e:
     print("Token summary failed:", e)
